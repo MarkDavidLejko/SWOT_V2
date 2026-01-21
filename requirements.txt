@@ -1,0 +1,4 @@
+streamlit>=1.31
+pydantic>=2.0
+google-adk
+reportlab>=4.0
