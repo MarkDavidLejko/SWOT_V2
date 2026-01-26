@@ -6,3 +6,5 @@ Im Terminal
 Im Gitbash
 Zum Ausführen "python -m streamlit run src/app.py"
 Zum Programieren wurde ChatGPT genutzt
+
+Für den Acess API Key braucht man einen Key von der Google Cloud. Unter anderem erhältlich unter: https://console.cloud.google.com/apis/credentials?project=gen-lang-client-0039768934
