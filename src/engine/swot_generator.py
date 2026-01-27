@@ -14,6 +14,12 @@ from engine.utils import (
     sanitize_text,
 )
 
+# Optional extra ADK loop agent (1–2 loops) to refine already-valid SWOT output.
+try:
+    from adk_extra_agents import refine_swot_loop_agent
+except Exception:  # noqa: BLE001
+    refine_swot_loop_agent = None  # type: ignore
+
 # ----------------------------
 # LLM client abstraction
 # ----------------------------
@@ -317,6 +323,21 @@ def generate_swot(inputs: Dict[str, Any], api_key: str, use_cache: bool = True) 
     parsed: Optional[Dict[str, Any]] = None
     try:
         parsed = parse_raw_to_dict(raw)
+        # Loop agent refinement (1–2 loops) to make bullets less generic.
+        if refine_swot_loop_agent is not None:
+            try:
+                parsed = refine_swot_loop_agent(
+                    api_key=key,
+                    swot_json=parsed,
+                    bullet_count=bullet_count,
+                    include_assumptions=include_assumptions,
+                    max_loops=2,
+                )
+                raw_model_output = raw_model_output + "\n\n---REFINE_LOOP_APPLIED---"
+            except Exception:
+                # Keep original parsed output; do not break existing behavior.
+                pass
+
         res = _postprocess_and_validate(parsed, bullet_count, include_assumptions)
         res.raw_model_output = raw_model_output
 
@@ -340,6 +361,19 @@ def generate_swot(inputs: Dict[str, Any], api_key: str, use_cache: bool = True) 
 
         try:
             parsed = parse_raw_to_dict(repaired)
+            if refine_swot_loop_agent is not None:
+                try:
+                    parsed = refine_swot_loop_agent(
+                        api_key=key,
+                        swot_json=parsed,
+                        bullet_count=bullet_count,
+                        include_assumptions=include_assumptions,
+                        max_loops=2,
+                    )
+                    raw_model_output = raw_model_output + "\n\n---REFINE_LOOP_APPLIED---"
+                except Exception:
+                    pass
+
             res = _postprocess_and_validate(parsed, bullet_count, include_assumptions)
             res.raw_model_output = raw_model_output
             return res

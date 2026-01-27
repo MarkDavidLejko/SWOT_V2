@@ -33,7 +33,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from email.message import EmailMessage
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 
 def _run_sync(coro):
@@ -250,6 +250,151 @@ def time_agent_get_time(*, api_key: Optional[str], model: str = "gemini-2.5-flas
     return _run_sync(_run_agent_once(api_key=api_key, agent=agent, prompt=prompt))
 
 
+def followup_agent_get_questions(
+    *,
+    api_key: Optional[str],
+    venture_context: str,
+    model: str = "gemini-2.5-flash",
+    max_questions: int = 4,
+) -> List[str]:
+    """ADK Follow-up Questions Agent.
+
+    Returns a list of clarifying questions that would materially improve the SWOT.
+    Output is deterministic-ish by bounding count + format.
+    """
+
+    try:
+        from google.adk.agents.llm_agent import Agent
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("Missing dependency: google-adk. Install it.") from e
+
+    agent = Agent(
+        model=model,
+        name="followup_questions_agent",
+        description="Asks focused follow-up questions to improve business analysis inputs.",
+        instruction=(
+            "You ask ONLY follow-up questions that are truly necessary to improve a SWOT. "
+            f"Return STRICT JSON ONLY as an array of 0 to {max_questions} strings. "
+            "If the input is already sufficient, return an empty array []. "
+            "Each question must be short, concrete, and answerable in 1–2 sentences."
+        ),
+    )
+
+    import json
+
+    prompt = (
+        "Given this venture context, decide whether you need clarifying questions before producing a strong SWOT.\n\n"
+        f"CONTEXT:\n{venture_context}\n"
+    )
+
+    text = _run_sync(_run_agent_once(api_key=api_key, agent=agent, prompt=prompt))
+    try:
+        arr = json.loads(text)
+        if isinstance(arr, list):
+            out: List[str] = []
+            for x in arr:
+                if isinstance(x, str) and x.strip():
+                    out.append(x.strip())
+            return out[:max_questions]
+    except Exception:
+        pass
+    return []
+
+
+def action_plan_30d_agent(
+    *,
+    api_key: Optional[str],
+    swot_markdown: str,
+    model: str = "gemini-2.5-flash",
+) -> str:
+    """ADK 30-day Action Plan Agent.
+
+    Produces a practical, day-by-day / week-by-week plan based on the SWOT.
+    """
+
+    try:
+        from google.adk.agents.llm_agent import Agent
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("Missing dependency: google-adk. Install it.") from e
+
+    agent = Agent(
+        model=model,
+        name="action_plan_30d_agent",
+        description="Builds an executable 30-day action plan derived from a SWOT.",
+        instruction=(
+            "Create a 30-day action plan based on the SWOT below. "
+            "Output plain text ONLY (no JSON). "
+            "Structure strictly as:\n"
+            "- Goal (1–2 lines)\n"
+            "- Week 1..4 (each with 3–5 actions)\n"
+            "- Daily checklist (10 short bullets that can repeat across days)\n"
+            "- Metrics (5 bullets)\n"
+            "Keep each action concrete, measurable, and tied to the SWOT."
+        ),
+    )
+
+    prompt = f"SWOT (markdown):\n{swot_markdown}\n"
+    return _run_sync(_run_agent_once(api_key=api_key, agent=agent, prompt=prompt))
+
+
+def refine_swot_loop_agent(
+    *,
+    api_key: Optional[str],
+    swot_json: Dict[str, Any],
+    bullet_count: int,
+    include_assumptions: bool,
+    max_loops: int = 2,
+    model: str = "gemini-2.5-flash",
+) -> Dict[str, Any]:
+    """ADK loop agent to refine SWOT JSON (1–2 loops).
+
+    It edits wording to be more specific and consistent while keeping the exact schema.
+    """
+
+    try:
+        from google.adk.agents.llm_agent import Agent
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("Missing dependency: google-adk. Install it.") from e
+
+    import json
+
+    keys = "strengths, weaknesses, opportunities, threats" + (", assumptions" if include_assumptions else "")
+
+    agent = Agent(
+        model=model,
+        name="swot_refine_loop_agent",
+        description="Refines an already-valid SWOT JSON to be more specific and actionable.",
+        instruction=(
+            "You will be given a SWOT JSON that is already valid. "
+            "Improve specificity and remove generic phrasing while preserving meaning. "
+            "Hard constraints:\n"
+            f"- Output MUST be STRICT JSON ONLY with exactly these top-level keys: {keys}\n"
+            f"- strengths/weaknesses/opportunities/threats MUST each be arrays of exactly {bullet_count} strings\n"
+            "- Keep bullets <= 180 characters\n"
+            + (
+                "- If assumptions exists, keep it as an object with quadrant arrays (1–3 items each), <= 140 chars\n"
+                if include_assumptions
+                else ""
+            )
+            + "Do not add new top-level keys."
+        ),
+    )
+
+    current = swot_json
+    for _ in range(max(1, min(2, int(max_loops)))):
+        prompt = "Refine this SWOT JSON:\n" + json.dumps(current, ensure_ascii=False)
+        text = _run_sync(_run_agent_once(api_key=api_key, agent=agent, prompt=prompt))
+        try:
+            nxt = json.loads(text)
+            if isinstance(nxt, dict) and nxt.get("strengths"):
+                current = nxt
+        except Exception:
+            # If model misbehaves, keep current (do not break existing flow).
+            pass
+
+    return current
+
+
 def pdf_agent_create_pdf_base64(
     *,
     api_key: Optional[str],
@@ -267,14 +412,18 @@ def pdf_agent_create_pdf_base64(
     except Exception as e:  # noqa: BLE001
         raise RuntimeError("Missing dependency: google-adk. Install it.") from e
 
+    # Requirement: integrate time into the PDF output (so the PDF shows the time, not the UI).
+    # We do this by letting the agent call the time tool first and then passing it into the PDF body.
     agent = Agent(
         model=model,
         name="pdf_agent",
         description="Creates PDFs from provided content.",
-        tools=[build_pdf_base64],
+        tools=[get_current_time, build_pdf_base64],
         instruction=(
-            "Call build_pdf_base64 exactly once with the provided title and content. "
-            "Return ONLY the JSON from the tool call (no markdown, no extra text)."
+            "1) Call get_current_time(tz='Europe/Berlin') exactly once. "
+            "2) Prepend a first line to the document content: 'Generated at: <pretty> (<timezone>) [ISO: <iso>]' "
+            "3) Call build_pdf_base64 exactly once with the provided title and the updated content. "
+            "4) Return ONLY the JSON from the build_pdf_base64 tool call (no markdown, no extra text)."
         ),
     )
 
@@ -287,8 +436,10 @@ def pdf_agent_create_pdf_base64(
     try:
         return json.loads(text)
     except Exception:
-        # Fallback: if the model didn't comply, create directly (keeps features working).
-        return build_pdf_base64(title=title, content=content)
+        # Fallback: create directly with local time injected (keeps features working).
+        t = get_current_time("Europe/Berlin")
+        header = f"Generated at: {t.get('pretty','')} ({t.get('timezone','')}) [ISO: {t.get('iso','')}]\n\n"
+        return build_pdf_base64(title=title, content=header + (content or ""))
 
 
 def email_agent_draft_email(
@@ -334,3 +485,4 @@ def email_agent_draft_email(
         subject = "SWOT results"
         body = "SWOT results:\n\n" + swot_markdown
         return EmailDraft(subject=subject, body=body)
+

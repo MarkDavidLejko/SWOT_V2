@@ -6,10 +6,11 @@ import html
 import streamlit as st
 
 from adk_extra_agents import (
-    time_agent_get_time,
     pdf_agent_create_pdf_base64,
     email_agent_draft_email,
     send_email_smtp,
+    followup_agent_get_questions,
+    action_plan_30d_agent,
 )
 
 from engine.swot_generator import generate_swot
@@ -84,6 +85,10 @@ DEFAULT_STATE = {
     "pdf_base64": "",
     "email_subject": "",
     "email_body": "",
+    "logged_in": False,
+    "followup_questions": [],
+    "followup_answers": {},
+    "action_plan_30d": "",
 }
 
 for k, v in DEFAULT_STATE.items():
@@ -96,6 +101,58 @@ def reset_state() -> None:
     for k, v in DEFAULT_STATE.items():
         st.session_state[k] = v
     st.session_state["api_key"] = keep_api_key
+
+
+def _append_login_audit(username: str, success: bool) -> None:
+    """Append login attempts to a CSV file (lightweight 'database')."""
+
+    import csv
+    from datetime import datetime
+
+    os.makedirs("data", exist_ok=True)
+    path = os.path.join("data", "login_log.csv")
+
+    # ISO timestamp in Europe/Berlin if available; fallback to local time.
+    try:
+        from zoneinfo import ZoneInfo
+
+        ts = datetime.now(ZoneInfo("Europe/Berlin")).isoformat(timespec="seconds")
+    except Exception:
+        ts = datetime.now().isoformat(timespec="seconds")
+
+    new_file = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow(["timestamp", "username", "success"])
+        w.writerow([ts, username, "1" if success else "0"])
+
+
+def _render_login_gate() -> None:
+    """Block access to the app until a successful login."""
+
+    st.title("Login")
+    st.write("Enter credentials to access the SWOT Builder interface.")
+
+    u = st.text_input("Username", value="", key="login_username")
+    p = st.text_input("Password", value="", type="password", key="login_password")
+
+    if st.button("Login", type="primary", use_container_width=True, key="login_btn"):
+        ok = (u or "") == "admin" and (p or "") == "admin"
+        _append_login_audit(username=(u or ""), success=ok)
+        if ok:
+            st.session_state.logged_in = True
+            # Do NOT modify widget state here; Streamlit will rerun anyway.
+            st.rerun()
+        else:
+            st.error("Invalid credentials.")
+
+
+
+# Login gate (single hard-coded account as requested).
+if not st.session_state.get("logged_in", False):
+    _render_login_gate()
+    st.stop()
 
 
 # -------------
@@ -180,10 +237,24 @@ with c3:
 
 generate = st.button("Generate SWOT", type="primary", use_container_width=True)
 
+# Follow-up questions (asked by an ADK agent) are shown here after the first click.
+if st.session_state.followup_questions:
+    st.subheader("Clarifying questions")
+    st.write("Answer these to improve output quality. Then continue.")
+
+    for i, q in enumerate(st.session_state.followup_questions, start=1):
+        key = f"followup_{i}"
+        prev = st.session_state.followup_answers.get(key, "")
+        st.session_state.followup_answers[key] = st.text_input(f"Q{i}: {q}", value=prev)
+
+    continue_btn = st.button("Continue", type="secondary", use_container_width=True, key="continue_after_followups")
+else:
+    continue_btn = False
+
 # ----------------------------
 # Generation flow
 # ----------------------------
-if generate:
+if generate or continue_btn:
     st.session_state.error = ""
     st.session_state.validation_warnings = []
     st.session_state.raw_model_output = ""
@@ -202,6 +273,45 @@ if generate:
         # Allow env var usage inside engine, but user asked for sidebar input; keep this strict.
         st.session_state.error = "API key is required in the sidebar."
     else:
+        # Ask follow-up questions once on the first run; then wait for user answers.
+        if generate and not st.session_state.followup_questions:
+            try:
+                venture_context = "\n".join(
+                    [
+                        f"Venture name: {venture_name_s.strip() or '(not provided)'}",
+                        f"Description: {venture_description_s.strip()}",
+                        f"Target market: {target_market_s.strip() or '(not provided)'}",
+                        f"Geography: {geography_s.strip() or '(not provided)'}",
+                        f"Stage: {stage_s.strip() or '(not provided)'}",
+                        f"Business model: {business_model_s.strip() or '(not provided)'}",
+                    ]
+                )
+                qs = followup_agent_get_questions(api_key=st.session_state.api_key, venture_context=venture_context)
+                if qs:
+                    st.session_state.followup_questions = qs
+                    st.session_state.error = "Please answer the clarifying questions and click Continue."
+                    st.rerun()
+            except Exception:
+                # If agent fails, we still continue with existing behavior.
+                pass
+
+        # If we have follow-up questions, require answers before continuing.
+        if st.session_state.followup_questions:
+            # Collect answers already stored by the input widgets.
+            answers = []
+            for i, q in enumerate(st.session_state.followup_questions, start=1):
+                key = f"followup_{i}"
+                a = (st.session_state.followup_answers.get(key) or "").strip()
+                if not a:
+                    st.session_state.error = "Please answer all clarifying questions, then click Continue."
+                    st.session_state.initialized = False
+                    st.stop()
+                answers.append((q, a))
+
+            # Merge answers into the venture description (keeps engine schema unchanged).
+            qa_block = "\n".join([f"Q: {q}\nA: {a}" for q, a in answers])
+            venture_description_s = (venture_description_s.strip() + "\n\nClarifications:\n" + qa_block).strip()
+
         request: Dict[str, Any] = {
             "venture_name": venture_name_s.strip(),
             "venture_description": venture_description_s.strip(),
@@ -231,6 +341,20 @@ if generate:
                 st.session_state.raw_model_output = result.raw_model_output or ""
                 st.session_state.validation_warnings = result.validation_warnings or []
                 st.session_state.initialized = True
+
+                # Sequential main agent #2: 30-day action plan (placed after the SWOT results).
+                try:
+                    md_for_plan = swot_to_md(st.session_state.swot)
+                    st.session_state.action_plan_30d = action_plan_30d_agent(
+                        api_key=st.session_state.api_key,
+                        swot_markdown=md_for_plan,
+                    )
+                except Exception:
+                    st.session_state.action_plan_30d = ""
+
+                # Reset follow-up state once we have a final result.
+                st.session_state.followup_questions = []
+                st.session_state.followup_answers = {}
 
             except Exception as e:
                 st.session_state.error = str(e)
@@ -322,6 +446,11 @@ if st.session_state.initialized and st.session_state.swot:
     else:
         st.write("- No action suggestions available.")
 
+    # 30-day action plan (generated by a second sequential ADK main agent).
+    if st.session_state.action_plan_30d:
+        st.subheader("30-day Action Plan")
+        st.text(st.session_state.action_plan_30d)
+
     if include_assumptions:
         st.subheader("Assumptions used")
         if isinstance(assumptions, dict):
@@ -374,27 +503,19 @@ if st.session_state.initialized and st.session_state.swot:
     # Additional ADK Agents
     # ----------------------------
     st.subheader("Agents")
-    a1, a2, a3 = st.columns(3)
-
-    # Zeit Agent
-    with a1:
-        if st.button("Zeit Agent: Show time", use_container_width=True):
-            try:
-                st.session_state.time_text = time_agent_get_time(api_key=st.session_state.api_key)
-            except Exception as e:
-                st.session_state.time_text = f"Error: {e}"
-
-        if st.session_state.time_text:
-            st.code(st.session_state.time_text, language="text")
+    a1, a2 = st.columns(2)
 
     # Erstelle PDF Agent
-    with a2:
+    with a1:
         if st.button("PDF Agent: Create PDF", use_container_width=True):
             try:
                 pdf_obj = pdf_agent_create_pdf_base64(
                     api_key=st.session_state.api_key,
                     title=f"SWOT – {sw.get('venture_name','').strip() or 'Venture'}",
-                    content=md_data,
+                    content=(
+                        md_data
+                        + ("\n\n\n30-day Action Plan\n" + st.session_state.action_plan_30d if st.session_state.action_plan_30d else "")
+                    ),
                 )
                 st.session_state.pdf_base64 = (pdf_obj or {}).get("base64", "")
             except Exception as e:
@@ -414,7 +535,7 @@ if st.session_state.initialized and st.session_state.swot:
             )
 
     # Email Agent
-    with a3:
+    with a2:
         recipient_email = st.text_input("Recipient email", value="", key="recipient_email")
         recipient_name = st.text_input("Recipient name (optional)", value="", key="recipient_name")
 
