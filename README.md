@@ -1,5 +1,10 @@
 ﻿# SWOT Application
 Vor dem Ausführen
+
+Beispielhafte Anleitung in VIsual Studio COde (könnte je nach system variieren):
+
+Öffnen/ Auswählen des Projektordners
+
 Im Terminal
 "python -m pip install -r requirements.txt"
 
