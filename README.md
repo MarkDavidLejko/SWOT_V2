@@ -21,4 +21,4 @@ Das Password ist: admin
 Für den Acess API Key braucht man einen Key von der Google Cloud. Unter anderem erhältlich unter: https://console.cloud.google.com/apis/credentials?project=gen-lang-client-0039768934
 
 Dannach alle Felder ausfüllen und auf "Generate SWOT" drücken. Gegebenenfalls mehr Fragen ausfüllen und auf "continue" drücken.
-Alle anderen Funktionen sind durch Linke Mausklicken zugänglich
+Alle anderen Funktionen sind danach durch Linke Mausklicken zugänglich
